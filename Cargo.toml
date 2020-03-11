@@ -1,0 +1,13 @@
+[package]
+name = "mutli-transport-tokio"
+version = "0.1.0"
+authors = ["dmolokanov <dmolokanov@users.noreply.github.com>"]
+edition = "2018"
+
+[dependencies]
+tokio = { version = "0.2.13", features  = ["full"] }
+native-tls = "0.2.4"
+tokio-tls = "0.3.0"
+futures = "0.3.4"
+futures-util = "0.3"
+bytes = "0.5.4"

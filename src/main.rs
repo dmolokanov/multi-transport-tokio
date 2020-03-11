@@ -14,9 +14,18 @@ use tokio::{
     stream::{Stream, StreamExt},
 };
 use tokio_tls::{TlsAcceptor, TlsStream};
+use tracing::{debug, error, warn, Level};
+use tracing_subscriber::{fmt::Subscriber, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let subscriber = Subscriber::builder()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_max_level(Level::TRACE)
+        .finish();
+
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
     let mut tcp = Transport::new_tcp("127.0.0.1:8881").await?;
     let incoming_tcp = tcp.incoming();
 
@@ -30,11 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(stream) => {
                 tokio::spawn(async move {
                     if let Err(e) = process(stream).await {
-                        eprintln!("failed to process connection: {}", e);
+                        error!("failed to process connection: {}", e);
                     }
                 });
             }
-            Err(e) => println!("Error: {}", e),
+            Err(e) => error!("Error: {}", e),
         }
     }
     Ok(())
@@ -78,8 +87,8 @@ impl Transport {
 
     fn incoming(&mut self) -> Incoming<'_> {
         match self {
-            Self::Tcp(listener) => Incoming::Tcp(listener),
-            Self::Tls(listener, acceptor) => Incoming::Tls(listener, acceptor, Default::default()),
+            Self::Tcp(listener) => Incoming::Tcp(IncomingTcp::new(listener)),
+            Self::Tls(listener, acceptor) => Incoming::Tls(IncomingTls::new(listener, acceptor)),
         }
     }
 }
@@ -88,71 +97,109 @@ type HandshakeFuture =
     Pin<Box<dyn Future<Output = Result<TlsStream<TcpStream>, native_tls::Error>>>>;
 
 enum Incoming<'a> {
-    Tcp(&'a mut TcpListener),
-    Tls(
-        &'a mut TcpListener,
-        &'a TlsAcceptor,
-        FuturesUnordered<HandshakeFuture>,
-    ),
+    Tcp(IncomingTcp<'a>),
+    Tls(IncomingTls<'a>),
 }
+
 impl Stream for Incoming<'_> {
     type Item = tokio::io::Result<StreamSelector>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
-            Self::Tcp(listener) => match listener.poll_accept(cx) {
-                Poll::Ready(Ok((tcp, _))) => {
-                    println!("TCP: Accepted connection from client");
-                    Poll::Ready(Some(Ok(StreamSelector::Tcp(tcp))))
+            Self::Tcp(incoming) => Pin::new(incoming).poll_next(cx),
+            Self::Tls(incoming) => Pin::new(incoming).poll_next(cx),
+        }
+    }
+}
+
+struct IncomingTcp<'a> {
+    listener: &'a mut TcpListener,
+}
+
+impl<'a> IncomingTcp<'a> {
+    fn new(listener: &'a mut TcpListener) -> Self {
+        Self { listener }
+    }
+}
+
+impl Stream for IncomingTcp<'_> {
+    type Item = tokio::io::Result<StreamSelector>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.listener.poll_accept(cx) {
+            Poll::Ready(Ok((tcp, _))) => {
+                debug!("TCP: Accepted connection from client");
+                Poll::Ready(Some(Ok(StreamSelector::Tcp(tcp))))
+            }
+            Poll::Ready(Err(err)) => {
+                error!(
+                    "TCP: Dropping client that failed to completely establish a TCP connection: {}",
+                    err
+                );
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct IncomingTls<'a> {
+    listener: &'a mut TcpListener,
+    acceptor: &'a TlsAcceptor,
+    connections: FuturesUnordered<HandshakeFuture>,
+}
+
+impl<'a> IncomingTls<'a> {
+    fn new(listener: &'a mut TcpListener, acceptor: &'a TlsAcceptor) -> Self {
+        Self {
+            listener,
+            acceptor,
+            connections: FuturesUnordered::default(),
+        }
+    }
+}
+
+impl Stream for IncomingTls<'_> {
+    type Item = tokio::io::Result<StreamSelector>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.listener.poll_accept(cx) {
+                Poll::Ready(Ok((stream, _))) => {
+                    let acceptor = self.acceptor.clone();
+                    self.connections
+                        .push(Box::pin(async move { acceptor.accept(stream).await }));
                 }
-                Poll::Ready(Err(err)) => {
-                    eprintln!(
-                        "TCP: Dropping client that failed to completely establish a TCP connection: {}",
-                        err
-                    );
-                    Poll::Ready(Some(Err(err)))
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            Self::Tls(listener, acceptor, connections) => {
-                loop {
-                    match listener.poll_accept(cx) {
-                        Poll::Ready(Ok((stream, _))) => {
-                            let acceptor = acceptor.clone();
-                            connections.push(Box::pin(async move {
-                                acceptor.accept(stream).await
-                            }));
-                        },
-                        Poll::Ready(Err(err)) =>
-                            eprintln!("TCP: Dropping client that failed to completely establish a TCP connection: {}", err),
-                        Poll::Pending => break,
-                    }
+                Poll::Ready(Err(err)) => warn!(
+                    "TCP: Dropping client that failed to completely establish a TCP connection: {}",
+                    err
+                ),
+                Poll::Pending => break,
+            }
+        }
+
+        loop {
+            if self.connections.is_empty() {
+                return Poll::Pending;
+            }
+
+            match Pin::new(&mut self.connections).poll_next(cx) {
+                Poll::Ready(Some(Ok(stream))) => {
+                    debug!("TLS: Accepted connection from client");
+                    return Poll::Ready(Some(Ok(StreamSelector::Tls(stream))));
                 }
 
-                loop {
-                    if connections.is_empty() {
-                        return Poll::Pending;
-                    }
+                Poll::Ready(Some(Err(err))) => warn!(
+                    "TLS: Dropping client that failed to complete a TLS handshake: {}",
+                    err
+                ),
 
-                    match Pin::new(&mut *connections).poll_next(cx) {
-                        Poll::Ready(Some(Ok(stream))) => {
-                            println!("TLS: Accepted connection from client");
-                            return Poll::Ready(Some(Ok(StreamSelector::Tls(stream))));
-                        }
-
-                        Poll::Ready(Some(Err(err))) => eprintln!(
-                            "TLS: Dropping client that failed to complete a TLS handshake: {}",
-                            err
-                        ),
-
-                        Poll::Ready(None) => {
-                            println!("TLS: Shutting down web server");
-                            return Poll::Ready(None);
-                        }
-
-                        Poll::Pending => return Poll::Pending,
-                    }
+                Poll::Ready(None) => {
+                    debug!("TLS: Shutting down web server");
+                    return Poll::Ready(None);
                 }
+
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
